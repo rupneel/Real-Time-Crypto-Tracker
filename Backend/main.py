@@ -1,10 +1,16 @@
-from fastapi import FastAPI, Query, HTTPException
+import time
+
+CACHE = {}
+CACHE_TTL = 60  # seconds
+
+
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 
 app = FastAPI(title="Real-Time Crypto Tracker API")
 
-# CORS (allow frontend later)
+# ---------- CORS ----------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -12,59 +18,93 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------- CONSTANTS ----------
 COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
+HEADERS = {
+    "User-Agent": "Real-Time-Crypto-Tracker/1.0"
+}
 
+# ---------- HEALTH ----------
 @app.get("/")
-def health_check():
-    return {
-        "status": "ok",
-        "message": "Crypto Tracker Backend is running"
-    }
+def root():
+    return {"status": "ok", "message": "Backend running"}
 
+# ---------- PRICES ----------
 @app.get("/prices")
 def get_prices(
     limit: int = Query(10, ge=1, le=50),
     currency: str = Query("usd", pattern="^(usd|inr)$")
 ):
-    try:
-        params = {
-            "vs_currency": currency,
-            "order": "market_cap_desc",
-            "per_page": limit,
-            "page": 1,
-            "sparkline": False
-        }
+    cache_key = f"{currency}_{limit}"
+    now = time.time()
 
-        response = requests.get(COINGECKO_URL, params=params, timeout=10)
+    # ✅ Serve cached data if valid
+    if cache_key in CACHE:
+        cached = CACHE[cache_key]
+        if now - cached["timestamp"] < CACHE_TTL:
+            return cached["data"]
+
+    params = {
+        "vs_currency": currency,
+        "order": "market_cap_desc",
+        "per_page": limit,
+        "page": 1,
+        "sparkline": False
+    }
+
+    try:
+        response = requests.get(
+            COINGECKO_URL,
+            params=params,
+            headers=HEADERS,
+            timeout=10
+        )
 
         if response.status_code != 200:
-            raise HTTPException(
-                status_code=502,
-                detail="Failed to fetch data from CoinGecko"
-            )
+            if cache_key in CACHE:
+                return CACHE[cache_key]["data"]
 
-        data = response.json()
+            return {
+                "currency": currency,
+                "count": 0,
+                "data": [],
+                "warning": "Temporary data provider issue"
+            }
 
-        # Return only clean fields
+        raw_data = response.json()
+
         clean_data = [
             {
-                "name": coin["name"],
-                "symbol": coin["symbol"],
-                "price": coin["current_price"],
-                "change_24h": coin["price_change_percentage_24h"],
-                "market_cap": coin["market_cap"]
+                "name": coin.get("name"),
+                "symbol": coin.get("symbol"),
+                "price": coin.get("current_price"),
+                "change_24h": coin.get("price_change_percentage_24h"),
+                "market_cap": coin.get("market_cap")
             }
-            for coin in data
+            for coin in raw_data
         ]
 
-        return {
+        result = {
             "currency": currency,
             "count": len(clean_data),
             "data": clean_data
         }
 
+        # ✅ Cache per (currency, limit)
+        CACHE[cache_key] = {
+            "timestamp": now,
+            "data": result
+        }
+
+        return result
+
     except requests.exceptions.RequestException:
-        raise HTTPException(
-            status_code=500,
-            detail="External API error"
-        )
+        if cache_key in CACHE:
+            return CACHE[cache_key]["data"]
+
+        return {
+            "currency": currency,
+            "count": 0,
+            "data": [],
+            "warning": "External API error"
+        }
